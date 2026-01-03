@@ -5,6 +5,28 @@ import streamlit as st
 st.set_page_config(page_title="Bonus Parlay EV + Breakeven", layout="centered")
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def infer_true_prob_from_decimal_odds(decimal_odds: float, house_edge: float) -> float:
+    """Infer a 'true' probability from offered decimal odds and a simple edge factor.
+
+    Base implied probability is 1/odds. We then discount by (1 - house_edge).
+    """
+    implied = 1.0 / decimal_odds
+    return _clamp01(implied * (1.0 - house_edge))
+
+
+def true_prob_from_cash_bet_ev(decimal_odds: float, ev_roi: float) -> float:
+    """Given EV as net ROI on a normal cash bet, infer win probability.
+
+    For a $1 stake cash bet with decimal odds O, EV(net) = p*O - 1.
+    So p = (1 + EV) / O.
+    """
+    return _clamp01((1.0 + ev_roi) / decimal_odds)
+
+
 def calc_ev(
     wager,
     bonus_val,
@@ -21,11 +43,7 @@ def calc_ev(
     offers = [offer1, offer2, offer3]
     for i, p in enumerate(ps):
         if p is None:
-            # Decimal odds implied probability is 1/odds.
-            # Use house_edge as a simple discount on implied probability.
-            implied = 1.0 / offers[i]
-            inferred = implied * (1.0 - house_edge)
-            ps[i] = max(0.0, min(1.0, inferred))
+            ps[i] = infer_true_prob_from_decimal_odds(offers[i], house_edge)
     true_prob1, true_prob2, true_prob3 = ps
 
     win_all = offer1 * offer2 * offer3 * wager
@@ -77,13 +95,12 @@ def breakeven_true_prob_bet2_equal_bet3(
     """
     Breakeven true probability p for bet2 and bet3 (assumed equal),
     such that EV payout == wager (same EV structure as calc_ev()).
-    bet1 fixed. If true_prob1 is None, inferred as 1/(offer1+house_edge).
+    bet1 fixed. If true_prob1 is None, inferred from offer1 and house_edge.
     """
     if true_prob1 is not None:
         q = true_prob1
     else:
-        implied1 = 1.0 / offer1
-        q = max(0.0, min(1.0, implied1 * (1.0 - house_edge)))
+        q = infer_true_prob_from_decimal_odds(offer1, house_edge)
     O = offer1 * (offer23 ** 2)
     B = bonus_val
 
@@ -184,6 +201,39 @@ st.dataframe(df_true, use_container_width=True)
 
 st.write("### Outcome probabilities (per your model)")
 st.dataframe(df_probs, use_container_width=True)
+
+st.divider()
+st.subheader("Bonus cash calculator")
+
+bonus_wager = st.number_input("Bonus wager ($)", min_value=0.0, value=float(wager), step=1.0)
+bonus_odds = st.number_input("Odds (decimal)", min_value=1.0, value=3.0, step=0.01)
+bonus_ev_pct = st.number_input(
+    "EV of the wager (net %, cash bet)",
+    value=0.0,
+    step=0.25,
+    help="Interpreted as net ROI% on a normal cash bet at these odds. Example: +5 means EV = +0.05 per $1 staked.",
+)
+
+implied_prob = 1.0 / bonus_odds
+implied_prob_after_edge = infer_true_prob_from_decimal_odds(bonus_odds, house_edge)
+true_prob_from_ev = true_prob_from_cash_bet_ev(bonus_odds, bonus_ev_pct / 100.0)
+
+bonus_profit_if_win = bonus_wager * (bonus_odds - 1.0)
+bonus_ev_cash = true_prob_from_ev * bonus_profit_if_win
+bonus_ev_per_dollar = (bonus_ev_cash / bonus_wager) if bonus_wager else 0.0
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Profit if win ($)", f"{bonus_profit_if_win:.4f}")
+c2.metric("Expected cash return ($)", f"{bonus_ev_cash:.4f}")
+c3.metric("Return per $1 bonus", f"{bonus_ev_per_dollar:.4f}")
+
+df_bonus = pd.DataFrame(
+    {
+        "Metric": ["Implied prob (offered)", "Implied prob (after house edge)", "True prob (from EV input)"],
+        "Value": [implied_prob, implied_prob_after_edge, true_prob_from_ev],
+    }
+)
+st.dataframe(df_bonus, use_container_width=True)
 
 st.divider()
 st.subheader("Breakeven true probability for bet2 = bet3 (bet1 fixed)")
