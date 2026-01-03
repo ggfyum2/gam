@@ -371,7 +371,8 @@ if img is not None:
     if Image is None:
         st.error("Pillow is required for image OCR. Add `pillow` to requirements and install it.")
     else:
-        st.image(img, caption="Pasted screenshot", use_container_width=True)
+        # Fixed-size preview so the page layout doesn't get blown out by large screenshots.
+        st.image(img, caption="Pasted screenshot", width=420)
 
         # Auto-run OCR when a new screenshot is pasted.
         new_fp = None
