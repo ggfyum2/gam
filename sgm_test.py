@@ -5,27 +5,9 @@ import streamlit as st
 st.set_page_config(page_title="Bonus Parlay EV + Breakeven", layout="centered")
 
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-
-def infer_true_prob_from_decimal_odds(decimal_odds: float, house_edge: float) -> float:
-    """Infer a 'true' probability from offered decimal odds and a simple edge factor.
-
-    Base implied probability is 1/odds. We then discount by (1 - house_edge).
-    """
-    implied = 1.0 / decimal_odds
-    return _clamp01(implied * (1.0 - house_edge))
-
-
-def true_prob_from_cash_bet_ev(decimal_odds: float, ev_roi: float) -> float:
-    """Given EV as net ROI on a normal cash bet, infer win probability.
-
-    For a $1 stake cash bet with decimal odds O, EV(net) = p*O - 1.
-    So p = (1 + EV) / O.
-    """
-    return _clamp01((1.0 + ev_roi) / decimal_odds)
-
+# ----------------------------
+# Core EV functions
+# ----------------------------
 
 def calc_ev(
     wager,
@@ -38,50 +20,45 @@ def calc_ev(
     true_prob2=None,
     true_prob3=None,
 ):
-    # infer missing probabilities
+    """
+    Your original model:
+    - If ALL 3 legs win => payout = offer1*offer2*offer3*wager
+    - If exactly 1 leg loses => payout = bonus_val*wager
+    - Otherwise => payout = 0
+    EV shown as payout EV and net EV (minus wager)
+    """
     ps = [true_prob1, true_prob2, true_prob3]
     offers = [offer1, offer2, offer3]
     for i, p in enumerate(ps):
         if p is None:
-            ps[i] = infer_true_prob_from_decimal_odds(offers[i], house_edge)
+            ps[i] = 1.0 / (offers[i] + house_edge)
     true_prob1, true_prob2, true_prob3 = ps
 
     win_all = offer1 * offer2 * offer3 * wager
     lose_1 = bonus_val * wager
 
     p_wa = true_prob1 * true_prob2 * true_prob3
-
     p_l1 = (
         true_prob1 * (1 - true_prob2) * true_prob3
         + (1 - true_prob1) * true_prob2 * true_prob3
         + true_prob1 * true_prob2 * (1 - true_prob3)
     )
 
-    # Exactly two lose (i.e., exactly one wins)
-    p_l2 = (
-        true_prob1 * (1 - true_prob2) * (1 - true_prob3)
-        + (1 - true_prob1) * true_prob2 * (1 - true_prob3)
-        + (1 - true_prob1) * (1 - true_prob2) * true_prob3
-    )
-    p_la = (1 - true_prob1) * (1 - true_prob2) * (1 - true_prob3)
-
+    # EV of payout (your model ignores other outcomes' payouts = 0)
     ev_payout = p_wa * win_all + p_l1 * lose_1
     ev_net = ev_payout - wager
 
-    out = {
+    return {
         "true_prob1": true_prob1,
         "true_prob2": true_prob2,
         "true_prob3": true_prob3,
         "p_win_all": p_wa,
         "p_lose_1_get_bonus": p_l1,
-        "p_lose_2": p_l2,
-        "p_lose_all": p_la,
         "win_all_payout": win_all,
         "lose_1_payout": lose_1,
         "ev_payout": ev_payout,
         "ev_net": ev_net,
     }
-    return out
 
 
 def breakeven_true_prob_bet2_equal_bet3(
@@ -95,12 +72,9 @@ def breakeven_true_prob_bet2_equal_bet3(
     """
     Breakeven true probability p for bet2 and bet3 (assumed equal),
     such that EV payout == wager (same EV structure as calc_ev()).
-    bet1 fixed. If true_prob1 is None, inferred from offer1 and house_edge.
+    bet1 fixed. If true_prob1 is None, inferred as 1/(offer1+house_edge).
     """
-    if true_prob1 is not None:
-        q = true_prob1
-    else:
-        q = infer_true_prob_from_decimal_odds(offer1, house_edge)
+    q = true_prob1 if true_prob1 is not None else 1.0 / (offer1 + house_edge)
     O = offer1 * (offer23 ** 2)
     B = bonus_val
 
@@ -136,6 +110,37 @@ def breakeven_true_prob_bet2_equal_bet3(
     return min(candidates, key=lambda p: abs(ev_ratio(p) - 1.0))
 
 
+def bonus_cash_ev(
+    wager,
+    odds,
+    house_edge=0.06,
+    true_prob=None,
+):
+    """
+    "Bonus cash" bet EV:
+    - You stake bonus cash, so you do NOT get the stake back.
+    - Example: wager=50, odds=3.0 -> profit on win = (odds-1)*wager = 100 (not 150)
+    - On loss: payout=0
+    EV is computed using true probability.
+      - If true_prob is None, infer as 1/(odds+house_edge) (same convention as elsewhere).
+    Returns payout EV and net EV (net is same as payout here since stake is bonus).
+    """
+    p = true_prob if true_prob is not None else 1.0 / (odds + house_edge)
+    win_payout = (odds - 1.0) * wager  # profit only, no stake returned
+    ev_payout = p * win_payout
+    ev_net = ev_payout  # since you didn't pay real cash / no stake returned
+    return {
+        "true_prob": p,
+        "win_payout": win_payout,
+        "ev_payout": ev_payout,
+        "ev_net": ev_net,
+    }
+
+
+# ----------------------------
+# UI
+# ----------------------------
+
 st.title("Bonus Parlay EV + Breakeven (bet2 = bet3)")
 
 with st.sidebar:
@@ -143,9 +148,11 @@ with st.sidebar:
 
     wager = st.number_input("Wager ($)", min_value=0.0, value=50.0, step=1.0)
     bonus_val = st.number_input(
-        "Bonus cash value (as $ per $1 bonus)", min_value=0.0, value=1.0, step=0.05
+        "Bonus value (as $ per $1 bonus)", min_value=0.0, value=1.0, step=0.05
     )
-    house_edge = st.number_input("House edge (used to infer probs)", min_value=0.0, value=0.06, step=0.01)
+    house_edge = st.number_input(
+        "House edge (used to infer probs)", min_value=0.0, value=0.06, step=0.01
+    )
 
     st.subheader("Offers (decimal odds)")
     offer1 = st.number_input("Offer 1", min_value=1.0, value=2.0, step=0.01)
@@ -154,16 +161,32 @@ with st.sidebar:
 
     st.subheader("Optional true probs (leave blank to infer)")
     use_p1 = st.checkbox("Override true_prob1?", value=False)
-    true_prob1 = st.number_input("true_prob1", min_value=0.0, max_value=1.0, value=0.5, step=0.01) if use_p1 else None
+    true_prob1 = (
+        st.number_input("true_prob1", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
+        if use_p1
+        else None
+    )
 
     use_p2 = st.checkbox("Override true_prob2?", value=False)
-    true_prob2 = st.number_input("true_prob2", min_value=0.0, max_value=1.0, value=0.5, step=0.01) if use_p2 else None
+    true_prob2 = (
+        st.number_input("true_prob2", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
+        if use_p2
+        else None
+    )
 
     use_p3 = st.checkbox("Override true_prob3?", value=False)
-    true_prob3 = st.number_input("true_prob3", min_value=0.0, max_value=1.0, value=0.5, step=0.01) if use_p3 else None
+    true_prob3 = (
+        st.number_input("true_prob3", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
+        if use_p3
+        else None
+    )
 
 
-st.subheader("EV for your 3-leg bet")
+# ----------------------------
+# Section 1: Your 3-leg EV model
+# ----------------------------
+
+st.subheader("EV for your 3-leg bet (your model)")
 
 res = calc_ev(
     wager=wager,
@@ -182,17 +205,18 @@ col1.metric("EV payout ($)", f"{res['ev_payout']:.4f}")
 col2.metric("EV net ($)", f"{res['ev_net']:.4f}")
 col3.metric("EV net (%)", f"{(res['ev_net']/wager*100 if wager else 0):.4f}%")
 
-df_probs = pd.DataFrame(
-    {
-        "Metric": ["p(win all)", "p(lose exactly 1 & bonus)", "p(lose 2)", "p(lose all)"],
-        "Value": [res["p_win_all"], res["p_lose_1_get_bonus"], res["p_lose_2"], res["p_lose_all"]],
-    }
-)
 df_true = pd.DataFrame(
     {
         "Leg": ["1", "2", "3"],
         "Offer": [offer1, offer2, offer3],
-        "True prob": [res["true_prob1"], res["true_prob2"], res["true_prob3"]],
+        "True prob used": [res["true_prob1"], res["true_prob2"], res["true_prob3"]],
+    }
+)
+
+df_probs = pd.DataFrame(
+    {
+        "Metric": ["p(win all)", "p(lose exactly 1 & bonus)"],
+        "Value": [res["p_win_all"], res["p_lose_1_get_bonus"]],
     }
 )
 
@@ -202,43 +226,17 @@ st.dataframe(df_true, use_container_width=True)
 st.write("### Outcome probabilities (per your model)")
 st.dataframe(df_probs, use_container_width=True)
 
-st.divider()
-st.subheader("Bonus cash calculator")
 
-bonus_wager = st.number_input("Bonus wager ($)", min_value=0.0, value=float(wager), step=1.0)
-bonus_odds = st.number_input("Odds (decimal)", min_value=1.0, value=3.0, step=0.01)
-bonus_ev_pct = st.number_input(
-    "EV of the wager (net %, cash bet)",
-    value=0.0,
-    step=0.25,
-    help="Interpreted as net ROI% on a normal cash bet at these odds. Example: +5 means EV = +0.05 per $1 staked.",
-)
-
-implied_prob = 1.0 / bonus_odds
-implied_prob_after_edge = infer_true_prob_from_decimal_odds(bonus_odds, house_edge)
-true_prob_from_ev = true_prob_from_cash_bet_ev(bonus_odds, bonus_ev_pct / 100.0)
-
-bonus_profit_if_win = bonus_wager * (bonus_odds - 1.0)
-bonus_ev_cash = true_prob_from_ev * bonus_profit_if_win
-bonus_ev_per_dollar = (bonus_ev_cash / bonus_wager) if bonus_wager else 0.0
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Profit if win ($)", f"{bonus_profit_if_win:.4f}")
-c2.metric("Expected cash return ($)", f"{bonus_ev_cash:.4f}")
-c3.metric("Return per $1 bonus", f"{bonus_ev_per_dollar:.4f}")
-
-df_bonus = pd.DataFrame(
-    {
-        "Metric": ["Implied prob (offered)", "Implied prob (after house edge)", "True prob (from EV input)"],
-        "Value": [implied_prob, implied_prob_after_edge, true_prob_from_ev],
-    }
-)
-st.dataframe(df_bonus, use_container_width=True)
+# ----------------------------
+# Section 2: Breakeven p for bet2=bet3
+# ----------------------------
 
 st.divider()
 st.subheader("Breakeven true probability for bet2 = bet3 (bet1 fixed)")
 
-offer23 = st.number_input("Offer for bet2 and bet3 (same)", min_value=1.0, value=float(offer2), step=0.01)
+offer23 = st.number_input(
+    "Offer for bet2 and bet3 (same)", min_value=1.0, value=float(offer2), step=0.01
+)
 
 p_be = breakeven_true_prob_bet2_equal_bet3(
     wager=wager,
@@ -269,3 +267,111 @@ else:
         st.write("### Sanity check results (using p_be for leg2 & leg3)")
         st.write(f"EV payout: {check['ev_payout']:.6f} (target = wager {wager:.6f})")
         st.write(f"EV net: {check['ev_net']:.6f} (target = 0)")
+
+
+# ----------------------------
+# Section 3: Bonus cash EV calculator (new)
+# ----------------------------
+
+st.divider()
+st.subheader("Bonus cash EV (stake not returned)")
+
+st.caption(
+    "Bonus cash means you don’t get your stake back. "
+    "So wager=50 at odds=3.0 pays (3.0-1)*50=100 on win (not 150)."
+)
+
+bc_odds = st.number_input("Bonus cash odds", min_value=1.0, value=3.0, step=0.01)
+use_bc_p = st.checkbox("Override true probability for bonus cash?", value=False)
+bc_true_prob = (
+    st.number_input("Bonus cash true probability", min_value=0.0, max_value=1.0, value=0.33, step=0.01)
+    if use_bc_p
+    else None
+)
+
+if st.button("Calculate Bonus Cash EV"):
+    bc = bonus_cash_ev(
+        wager=wager,
+        odds=bc_odds,
+        house_edge=house_edge,
+        true_prob=bc_true_prob,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("True prob used", f"{bc['true_prob']:.6f}")
+    c2.metric("Win payout ($)", f"{bc['win_payout']:.4f}")
+    c3.metric("EV ($)", f"{bc['ev_net']:.4f}")
+
+    st.write(
+        f"If you stake **{wager:.2f}** bonus cash at **{bc_odds:.2f}** odds, "
+        f"you win **{bc['win_payout']:.2f}** (profit only) with probability **{bc['true_prob']:.4f}**."
+    )
+
+
+def bet_back_ev(
+    wager: float,
+    win_odds: float,
+    place_odds: float,
+    house_edge: float = 0.06,
+    bonus_val: float = 1.0,
+    true_prob_win: float | None = None,
+    true_prob_place: float | None = None,
+) -> dict:
+    """
+    EV for a single bet with a "bet back" feature:
+
+    Outcomes:
+      1) WIN:
+         - You get normal winnings (assumed stake returned): payout = win_odds * wager
+      2) LOSE but FINISH 2nd/3rd ("place" outcome):
+         - You get your wager back as BONUS CASH, valued at bonus_val per $1 bonus:
+           payout = bonus_val * wager
+      3) LOSE and NOT place:
+         - payout = 0
+
+    Probabilities:
+      - true_prob_win = P(win)
+      - true_prob_place = P(place | not win)   (conditional probability among non-wins)
+
+    If true_prob_win is None, inferred as 1/(win_odds + house_edge).
+    If true_prob_place is None, inferred as 1/(place_odds + house_edge).
+
+    EV logic:
+      P(win) = p_win
+      P(place_and_not_win) = (1 - p_win) * p_place
+      P(lose_all) = (1 - p_win) * (1 - p_place)
+
+      EV_payout = wager * [ p_win*win_odds + (1-p_win)*p_place*bonus_val ]
+      EV_net_cash = EV_payout - wager   (net vs staking real cash)
+      EV_net_bonus_stake = EV_payout    (if you treat the wager as bonus stake / no cash cost)
+
+    Returns a dict with probabilities and EVs.
+    """
+    # infer true probabilities if not provided
+    p_win = true_prob_win if true_prob_win is not None else 1.0 / (win_odds + house_edge)
+    p_place = true_prob_place if true_prob_place is not None else 1.0 / (place_odds + house_edge)
+
+    # probabilities of each payout-relevant event
+    p_place_not_win = (1.0 - p_win) * p_place
+    p_lose_all = (1.0 - p_win) * (1.0 - p_place)
+
+    # payouts
+    payout_win = win_odds * wager                 # stake returned on win
+    payout_betback = bonus_val * wager            # bet back as bonus cash
+    payout_lose = 0.0
+
+    # EV of payout
+    ev_payout = p_win * payout_win + p_place_not_win * payout_betback + p_lose_all * payout_lose
+
+    return {
+        "true_prob_win": p_win,
+        "true_prob_place_conditional": p_place,
+        "p_win": p_win,
+        "p_place_not_win": p_place_not_win,
+        "p_lose_all": p_lose_all,
+        "payout_win": payout_win,
+        "payout_betback": payout_betback,
+        "ev_payout": ev_payout,
+        "ev_net_cash": ev_payout - wager,
+        "ev_net_if_bonus_stake": ev_payout,
+    }
