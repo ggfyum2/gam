@@ -32,8 +32,14 @@ If `tesseract.exe` is installed but not on PATH, the default location is usually
 This repo includes `packages.txt` with:
 
 - `tesseract-ocr`
+- `tesseract-ocr-eng`
 
 On Debian/Ubuntu-based hosts that support `packages.txt`, this installs the Tesseract binary so OCR works.
+
+Deploy on Streamlit Cloud:
+
+- Push this folder to GitHub (repo root should contain `horse.py`, `requirements.txt`, and `packages.txt`).
+- In Streamlit Cloud set **Main file path** to `horse.py`.
 
 ### Docker (recommended for any server)
 
