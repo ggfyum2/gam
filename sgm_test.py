@@ -143,17 +143,11 @@ def bet_back_ev(
     """
     Single bet with "bet back" as bonus cash if you lose but place (2nd/3rd).
 
-    Outcomes:
-      - WIN: payout = win_odds * wager (stake returned on win)
-      - PLACE but NOT WIN: payout = bonus_val * wager (bet back as bonus cash)
-      - LOSE and NOT PLACE: payout = 0
+    This version treats place probability as CONDITIONAL on not winning:
+      true_prob_place = P(place | not win)
 
-    Probabilities:
-      - true_prob_win = P(win)  (if None, infer as 1/(win_odds+house_edge))
-      - true_prob_place = P(place | not win)  (conditional) (if None, infer as 1/(place_odds+house_edge))
-
-    NOTE: place_odds is treated as pricing the conditional "place given not win".
-    If your place odds are actually unconditional, tell me and I’ll adjust the math.
+    If your place odds are actually unconditional "Top 3 (includes win)",
+    use bet_back_ev_unconditional_place() below.
     """
     p_win = true_prob_win if true_prob_win is not None else 1.0 / (win_odds + house_edge)
     p_place_cond = true_prob_place if true_prob_place is not None else 1.0 / (place_odds + house_edge)
@@ -167,6 +161,7 @@ def bet_back_ev(
     ev_payout = p_win * payout_win + p_place_not_win * payout_betback
 
     return {
+        "model": "conditional_place_given_not_win",
         "true_prob_win": p_win,
         "true_prob_place_conditional": p_place_cond,
         "p_win": p_win,
@@ -180,6 +175,106 @@ def bet_back_ev(
     }
 
 
+def bet_back_ev_unconditional_place(
+    wager,
+    win_odds,
+    place_odds,
+    house_edge=0.06,
+    bonus_val=1.0,
+    true_prob_win=None,
+    true_prob_place_uncond=None,
+):
+    """
+    Single bet with "bet back" where PLACE means top-3 INCLUDING win.
+
+    Probabilities:
+      - P(win) = p_win
+      - P(place) = p_place_uncond (includes win)
+      - P(place but not win) = max(p_place_uncond - p_win, 0)
+
+    If true probs are None, inferred as 1/(odds + house_edge) (same convention as your other code).
+    """
+    p_win = true_prob_win if true_prob_win is not None else 1.0 / (win_odds + house_edge)
+    p_place = (
+        true_prob_place_uncond
+        if true_prob_place_uncond is not None
+        else 1.0 / (place_odds + house_edge)
+    )
+
+    p_place_not_win = max(p_place - p_win, 0.0)
+    p_lose_all = max(1.0 - p_place, 0.0)
+
+    payout_win = win_odds * wager
+    payout_betback = bonus_val * wager
+
+    ev_payout = p_win * payout_win + p_place_not_win * payout_betback
+
+    return {
+        "model": "unconditional_place_top3_includes_win",
+        "true_prob_win": p_win,
+        "true_prob_place_unconditional": p_place,
+        "p_win": p_win,
+        "p_place_not_win": p_place_not_win,
+        "p_lose_all": p_lose_all,
+        "payout_win": payout_win,
+        "payout_betback": payout_betback,
+        "ev_payout": ev_payout,
+        "ev_net_cash": ev_payout - wager,
+        "ev_net_if_bonus_stake": ev_payout,
+    }
+
+
+# ----------------------------
+# Vig (overround) + de-vigging for WIN + PLACE markets
+# ----------------------------
+
+def vig_from_win_place_markets(win_odds_list, place_odds_list, places=3):
+    """
+    Given odds for N runners (N < 10 ideally; UI supports up to 20),
+    compute:
+
+    WIN market:
+      implied_win_i = 1 / win_odds_i
+      overround_win = sum(implied_win_i) - 1
+      house_edge_win = overround_win  (as a fraction)
+
+      de-vig true win probs:
+        p_true_win_i = implied_win_i / sum(implied_win)
+
+    PLACE market (Top 'places', e.g. 3):
+      implied_place_i = 1 / place_odds_i
+      overround_place_abs = sum(implied_place_i) - places
+      overround_place_rel = sum(implied_place_i)/places - 1  (handy % measure)
+
+      de-vig true place probs (sum to 'places'):
+        p_true_place_i = implied_place_i / sum(implied_place) * places
+
+    Returns dict with edges and de-vigged probs.
+    """
+    # WIN
+    implied_win = [1.0 / o for o in win_odds_list]
+    sum_iw = sum(implied_win)
+    overround_win = sum_iw - 1.0
+    p_true_win = [p / sum_iw for p in implied_win] if sum_iw > 0 else [None] * len(implied_win)
+
+    # PLACE
+    implied_place = [1.0 / o for o in place_odds_list]
+    sum_ip = sum(implied_place)
+    overround_place_abs = sum_ip - float(places)
+    overround_place_rel = (sum_ip / float(places) - 1.0) if places > 0 else None
+    p_true_place = [p / sum_ip * float(places) for p in implied_place] if sum_ip > 0 else [None] * len(implied_place)
+
+    return {
+        "sum_implied_win": sum_iw,
+        "overround_win": overround_win,
+        "sum_implied_place": sum_ip,
+        "overround_place_abs": overround_place_abs,
+        "overround_place_rel": overround_place_rel,
+        "p_true_win": p_true_win,
+        "p_true_place": p_true_place,
+    }
+
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -187,7 +282,7 @@ def bet_back_ev(
 st.title("Bonus Parlay EV + Breakeven (bet2 = bet3)")
 
 with st.sidebar:
-    st.header("Inputs")
+    st.header("Global Inputs")
 
     wager = st.number_input("Wager ($)", min_value=0.0, value=50.0, step=1.0)
     bonus_val = st.number_input(
@@ -324,10 +419,10 @@ st.caption(
     "So wager=50 at odds=3.0 pays (3.0-1)*50=100 on win (not 150)."
 )
 
-bc_odds = st.number_input("Bonus cash odds", min_value=1.0, value=3.0, step=0.01)
-use_bc_p = st.checkbox("Override true probability for bonus cash?", value=False)
+bc_odds = st.number_input("Bonus cash odds", min_value=1.0, value=3.0, step=0.01, key="bc_odds")
+use_bc_p = st.checkbox("Override true probability for bonus cash?", value=False, key="bc_override")
 bc_true_prob = (
-    st.number_input("Bonus cash true probability", min_value=0.0, max_value=1.0, value=0.33, step=0.01)
+    st.number_input("Bonus cash true probability", min_value=0.0, max_value=1.0, value=0.33, step=0.01, key="bc_p")
     if use_bc_p
     else None
 )
@@ -345,55 +440,47 @@ if st.button("Calculate Bonus Cash EV"):
     c2.metric("Win payout ($)", f"{bc['win_payout']:.4f}")
     c3.metric("EV ($)", f"{bc['ev_net']:.4f}")
 
-    st.write(
-        f"If you stake **{wager:.2f}** bonus cash at **{bc_odds:.2f}** odds, "
-        f"you win **{bc['win_payout']:.2f}** (profit only) with probability **{bc['true_prob']:.4f}**."
-    )
-
 
 # ----------------------------
-# Section 4: Bet Back EV (new UI)
+# Section 4: Bet Back EV (single bet)
 # ----------------------------
 
 st.divider()
-st.subheader("Bet Back EV (lose but place => bet back as bonus cash)")
+st.subheader("Bet Back EV (single runner)")
 
 st.caption(
-    "Model: Win => normal payout (stake returned). "
-    "Lose but finish 2nd/3rd => wager returned as BONUS CASH (valued by bonus_val). "
-    "Lose and not place => 0."
+    "Two ways to interpret place odds:\n"
+    "- **Unconditional Top-3**: place includes win (typical). We use this below.\n"
+    "- Conditional given not win: supported in code, but not used by default."
 )
 
-bb_win_odds = st.number_input("Win odds", min_value=1.0, value=3.0, step=0.01)
-bb_place_odds = st.number_input("Place odds (2nd/3rd)", min_value=1.0, value=1.5, step=0.01)
+bb_win_odds = st.number_input("Win odds", min_value=1.0, value=3.0, step=0.01, key="bb_win_odds")
+bb_place_odds = st.number_input("Place odds (Top-3, includes win)", min_value=1.0, value=1.5, step=0.01, key="bb_place_odds")
 
-bb_override = st.checkbox("Override true probabilities for Bet Back?", value=False)
+bb_override = st.checkbox("Override true probabilities for Bet Back?", value=False, key="bb_override")
 if bb_override:
-    bb_true_win = st.number_input("True P(win)", min_value=0.0, max_value=1.0, value=0.30, step=0.01)
-    bb_true_place_cond = st.number_input(
-        "True P(place | not win)", min_value=0.0, max_value=1.0, value=0.30, step=0.01
-    )
+    bb_true_win = st.number_input("True P(win)", min_value=0.0, max_value=1.0, value=0.30, step=0.01, key="bb_pwin")
+    bb_true_place = st.number_input("True P(place Top-3)", min_value=0.0, max_value=1.0, value=0.45, step=0.01, key="bb_pplace")
 else:
     bb_true_win = None
-    bb_true_place_cond = None
+    bb_true_place = None
 
 if st.button("Calculate Bet Back EV"):
-    bb = bet_back_ev(
+    bb = bet_back_ev_unconditional_place(
         wager=wager,
         win_odds=bb_win_odds,
         place_odds=bb_place_odds,
         house_edge=house_edge,
         bonus_val=bonus_val,
         true_prob_win=bb_true_win,
-        true_prob_place=bb_true_place_cond,
+        true_prob_place_uncond=bb_true_place,
     )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("True P(win)", f"{bb['true_prob_win']:.6f}")
-    c2.metric("True P(place | not win)", f"{bb['true_prob_place_conditional']:.6f}")
+    c2.metric("True P(place)", f"{bb['true_prob_place_unconditional']:.6f}")
     c3.metric("EV payout ($)", f"{bb['ev_payout']:.4f}")
 
-    st.write("### Outcome probabilities")
     st.dataframe(
         pd.DataFrame(
             {
@@ -405,7 +492,141 @@ if st.button("Calculate Bet Back EV"):
         use_container_width=True,
     )
 
-    st.write("### EV summary")
-    st.write(f"EV (payout): **{bb['ev_payout']:.4f}**")
-    st.write(f"EV net vs cash stake (EV - wager): **{bb['ev_net_cash']:.4f}**")
-    st.write(f"EV if stake itself is bonus (treat wager as free): **{bb['ev_net_if_bonus_stake']:.4f}**")
+
+# ----------------------------
+# Section 5: Vig calculator (WIN + PLACE for up to 20 runners) + EV using bet-back wager
+# ----------------------------
+
+st.divider()
+st.subheader("Vig (Overround) calculator: WIN + PLACE markets (Top-3)")
+
+st.caption(
+    "Enter **win odds** and **place odds** for as many runners as you have (1 to N; up to 20). "
+    "Assumptions:\n"
+    "- Exactly **one** runner wins.\n"
+    "- **Place** means **Top-3 (1st/2nd/3rd), includes the winner**.\n"
+    "- We compute WIN overround vs 1, and PLACE overround vs 3.\n"
+    "- We also **de-vig** by normalizing implied probabilities."
+)
+
+N_MAX = 20
+rows = []
+
+# A compact grid: 20 rows x 3 cols
+for i in range(N_MAX):
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        name = st.text_input(f"Runner {i+1} name", value="", key=f"runner_name_{i}")
+    with c2:
+        w = st.text_input(f"Win odds {i+1}", value="", key=f"runner_win_{i}")
+    with c3:
+        p = st.text_input(f"Place odds {i+1}", value="", key=f"runner_place_{i}")
+
+    # parse
+    try:
+        win_odds = float(w) if str(w).strip() != "" else None
+    except ValueError:
+        win_odds = None
+    try:
+        place_odds = float(p) if str(p).strip() != "" else None
+    except ValueError:
+        place_odds = None
+
+    if name.strip() == "" and win_odds is None and place_odds is None:
+        continue
+
+    rows.append(
+        {
+            "runner": name.strip() if name.strip() else f"Runner {i+1}",
+            "win_odds": win_odds,
+            "place_odds": place_odds,
+        }
+    )
+
+valid = [r for r in rows if (r["win_odds"] is not None and r["place_odds"] is not None and r["win_odds"] >= 1 and r["place_odds"] >= 1)]
+
+if len(rows) == 0:
+    st.info("Fill at least one row (runner name optional, but both win odds and place odds are needed to compute vig).")
+elif len(valid) == 0:
+    st.warning("You have entries, but none have BOTH valid win odds and place odds (>= 1).")
+else:
+    win_odds_list = [r["win_odds"] for r in valid]
+    place_odds_list = [r["place_odds"] for r in valid]
+
+    vig = vig_from_win_place_markets(win_odds_list, place_odds_list, places=3)
+
+    # Show market edges
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("WIN sum implied", f"{vig['sum_implied_win']:.6f}")
+    c2.metric("WIN overround", f"{vig['overround_win']:.6f}")
+    c3.metric("PLACE sum implied", f"{vig['sum_implied_place']:.6f}")
+    c4.metric("PLACE overround (abs vs 3)", f"{vig['overround_place_abs']:.6f}")
+
+    st.write("PLACE overround (relative):", f"{(vig['overround_place_rel']*100):.3f}%" if vig["overround_place_rel"] is not None else "N/A")
+
+    # Build table with de-vigged probs
+    table = []
+    for r, pwin, pplace in zip(valid, vig["p_true_win"], vig["p_true_place"]):
+        table.append(
+            {
+                "Runner": r["runner"],
+                "Win odds": r["win_odds"],
+                "Place odds": r["place_odds"],
+                "De-vig P(win)": pwin,
+                "De-vig P(place top3)": pplace,
+                "Implied P(win)": 1.0 / r["win_odds"],
+                "Implied P(place)": 1.0 / r["place_odds"],
+            }
+        )
+    df = pd.DataFrame(table)
+    st.dataframe(df, use_container_width=True)
+
+    # Select one runner to compute Bet Back EV using the *de-vigged* probabilities
+    st.write("### Pick a runner to evaluate EV using the Bet Back feature (de-vigged probs)")
+    runner_names = [r["runner"] for r in valid]
+    pick = st.selectbox("Select runner", runner_names, index=0)
+
+    idx = runner_names.index(pick)
+    sel = valid[idx]
+    p_win_true = vig["p_true_win"][idx]
+    p_place_true = vig["p_true_place"][idx]
+
+    # sanity: place includes win, so place_not_win = place - win
+    p_place_not_win = p_place_true - p_win_true
+    if p_place_not_win < -1e-9:
+        st.warning(
+            "For this runner, de-vigged P(place) came out < P(win). "
+            "That can happen due to inconsistent markets; EV will clamp place_not_win to 0."
+        )
+    p_place_not_win = max(p_place_not_win, 0.0)
+
+    # EV with bet-back (unconditional place)
+    ev = bet_back_ev_unconditional_place(
+        wager=wager,
+        win_odds=sel["win_odds"],
+        place_odds=sel["place_odds"],
+        house_edge=house_edge,  # not used since we pass true probs, but kept for consistency
+        bonus_val=bonus_val,
+        true_prob_win=p_win_true,
+        true_prob_place_uncond=p_place_true,
+    )
+
+    st.write("### EV summary (selected runner)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("De-vig P(win)", f"{p_win_true:.6f}")
+    c2.metric("De-vig P(place)", f"{p_place_true:.6f}")
+    c3.metric("EV payout ($)", f"{ev['ev_payout']:.4f}")
+
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Outcome": ["Win", "Place but not win", "Lose all"],
+                "Probability": [ev["p_win"], ev["p_place_not_win"], ev["p_lose_all"]],
+                "Payout ($)": [ev["payout_win"], ev["payout_betback"], 0.0],
+            }
+        ),
+        use_container_width=True,
+    )
+
+    st.write(f"EV net vs cash stake: **{ev['ev_net_cash']:.4f}**")
+    st.write(f"EV if stake itself is bonus (treat wager as free): **{ev['ev_net_if_bonus_stake']:.4f}**")
